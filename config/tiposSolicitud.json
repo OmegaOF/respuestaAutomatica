@@ -1,0 +1,15 @@
+{
+  "tiposSolicitudActivos": [
+    "DEUDA_GENERAL",
+    "AGUINALDO",
+    "BONO_ABRIL",
+    "BONO_JUNIO",
+    "OTRO"
+  ],
+  "sinonimos": {
+    "DEUDA_GENERAL": ["deuda", "deuda general", "mi deuda", "saldo"],
+    "AGUINALDO": ["agui", "aguinaldo"],
+    "BONO_ABRIL": ["bono abril", "abril"],
+    "BONO_JUNIO": ["bono junio", "junio"]
+  }
+}
