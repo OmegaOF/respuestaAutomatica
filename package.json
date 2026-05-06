@@ -1,0 +1,26 @@
+{
+  "name": "whatsapp-chatbot-prestamos",
+  "version": "1.0.0",
+  "description": "Chatbot de atención por WhatsApp Web con IA local (Ollama) y Google Sheets",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node --watch index.js"
+  },
+  "keywords": [
+    "whatsapp",
+    "chatbot",
+    "google-sheets",
+    "ollama",
+    "prestamos"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "axios": "^1.7.9",
+    "dotenv": "^16.4.5",
+    "googleapis": "^144.0.0",
+    "qrcode-terminal": "^0.12.0",
+    "whatsapp-web.js": "^1.25.0"
+  }
+}
