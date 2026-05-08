@@ -12,6 +12,7 @@ const RESPONSES = {
 
 function resolveStatus(iaResult) {
   const hasMissingAmount = Array.isArray(iaResult.solicitudes) && iaResult.solicitudes.some((item) => String(item?.monto || '').trim() === 'NO_INDICADO');
+  if (iaResult.respuesta_tipo === 'FALTA_NOMBRE') return 'PENDIENTE_DATOS';
   if (iaResult.respuesta_tipo === 'FALTA_MONTO' || hasMissingAmount) return 'PENDIENTE_DATOS';
   if (iaResult.accion === 'ACLARAR') return 'PENDIENTE_DATOS';
   if (iaResult.requiere_humano === 'SI' || iaResult.accion === 'NO_ENTENDIDO') return 'EN_REVISION';
@@ -23,7 +24,8 @@ function hasRealLoanRequest(iaResult) {
 }
 
 function appendObservation(...observations) {
-  return observations.map((part) => String(part || '').trim()).filter(Boolean).join(' ');
+  const parts = observations.map((part) => String(part || '').trim()).filter(Boolean);
+  return [...new Set(parts)].join(' ');
 }
 
 async function analyzeIncomingMessage({ messageText, contactName, rowData }) {
@@ -38,6 +40,26 @@ async function analyzeIncomingMessage({ messageText, contactName, rowData }) {
 function buildUpdatesFromIA({ iaResult, messageText, phoneNumber, timezone, rowData, observations, forceHumanReview = false }) {
   const prevSolicitudes = rowData?.solicitudesDetectadas || '';
   const prevMap = parseSolicitudesString(prevSolicitudes);
+
+  if (iaResult.error_tipo === 'TIMEOUT_IA') {
+    iaResult.accion = 'NO_ENTENDIDO';
+    iaResult.requiere_humano = 'SI';
+    iaResult.respuesta_tipo = 'REVISION_HUMANA';
+    iaResult.observacion = appendObservation(iaResult.observacion, 'IA no respondió a tiempo. Revisar manualmente.');
+  } else if (iaResult.accion === 'NO_ENTENDIDO') {
+    iaResult.requiere_humano = 'SI';
+    iaResult.respuesta_tipo = 'REVISION_HUMANA';
+    iaResult.observacion = appendObservation(iaResult.observacion, 'Solicitud no entendida. Revisar manualmente.');
+  }
+
+  if (iaResult.respuesta_tipo === 'FALTA_NOMBRE') {
+    iaResult.requiere_humano = 'NO';
+    iaResult.observacion = appendObservation(iaResult.observacion, 'Falta nombre completo. Se solicitó al cliente.');
+  }
+
+  if (iaResult.respuesta_tipo === 'FALTA_MONTO') {
+    iaResult.observacion = appendObservation(iaResult.observacion, 'Falta monto aproximado.');
+  }
 
   if (iaResult.accion === 'REEMPLAZAR' && !hasClearSolicitudes(iaResult)) {
     iaResult.accion = 'NO_ENTENDIDO';
@@ -76,5 +98,6 @@ module.exports = {
   analyzeIncomingMessage,
   buildUpdatesFromIA,
   hasRealLoanRequest,
-  RESPONSES
+  RESPONSES,
+  appendObservation
 };

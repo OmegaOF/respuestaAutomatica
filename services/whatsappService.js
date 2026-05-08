@@ -2,7 +2,7 @@ const path = require('path');
 const qrcode = require('qrcode-terminal');
 const { Client, LocalAuth } = require('whatsapp-web.js');
 const { GoogleSheetsService, FINAL_STATES } = require('./googleSheetsService');
-const { analyzeIncomingMessage, buildUpdatesFromIA, hasRealLoanRequest, RESPONSES } = require('./chatbotService');
+const { analyzeIncomingMessage, buildUpdatesFromIA, hasRealLoanRequest, RESPONSES, appendObservation } = require('./chatbotService');
 const { normalizeText, isLikelyFullName, cleanNameCandidate } = require('../utils/textUtils');
 
 const PENDING_TTL_MS = 24 * 60 * 60 * 1000;
@@ -98,13 +98,30 @@ async function persistAttention({ sheetsService, phoneNumber, messageText, iaRes
   let rowData = target ? { solicitudesDetectadas: getSolicitudesFromRow(headers, currentRow) } : { solicitudesDetectadas: '' };
   let observations = target ? sheetsService.getRowObservations(headers, currentRow) : '';
   let forceHumanReview = false;
+  let officialNameToWrite = '';
 
   if (target && isLikelyFullName(detectedName)) {
     const officialName = sheetsService.getRowName(headers, currentRow);
     if (officialName && normalizeText(officialName) !== normalizeText(detectedName)) {
-      observations = `${observations ? `${observations} ` : ''}${buildNameMismatchObservation(detectedName, `No coincide con NOMBRE DE CLIENTE (${officialName})`)}`;
+      observations = appendObservation(observations, buildNameMismatchObservation(detectedName, `No coincide con NOMBRE DE CLIENTE (${officialName})`));
       forceHumanReview = true;
       console.log('[BOT] Nombre detectado no coincide con NOMBRE DE CLIENTE.');
+    }
+
+    if (!officialName) {
+      const nameMatch = await sheetsService.findNameMatch(detectedName);
+      if (nameMatch.ambiguous) {
+        observations = appendObservation(observations, buildNameMismatchObservation(detectedName, 'Tiene múltiples coincidencias posibles en la lista interna'));
+        forceHumanReview = true;
+        console.log('[BOT] Enviado a revisión humana por nombre ambiguo.');
+      } else if (!nameMatch.found) {
+        observations = appendObservation(observations, buildNameMismatchObservation(detectedName));
+        forceHumanReview = true;
+        console.log('[BOT] Nombre no coincide con lista interna:', detectedName);
+      } else {
+        officialNameToWrite = nameMatch.officialName;
+        console.log('[BOT] Nombre validado contra lista interna:', officialNameToWrite);
+      }
     }
   }
 
@@ -143,17 +160,55 @@ async function persistAttention({ sheetsService, phoneNumber, messageText, iaRes
     forceHumanReview
   });
 
+  if (officialNameToWrite) updates['NOMBRE DE CLIENTE'] = officialNameToWrite;
+
   await sheetsService.updateAllowedColumns({ headers, rowIndex, currentRow, updates });
   return reply;
 }
 
-async function handlePendingNameReply({ sheetsService, phoneNumber, messageText, timezone }) {
+async function updateAttentionFromIA({ sheetsService, phoneNumber, messageText, iaResult, timezone, existingAttention, forceHumanReview = false }) {
+  const headers = existingAttention.headers;
+  const rowIndex = existingAttention.rowIndex;
+  const currentRow = existingAttention.currentRow;
+  const rowData = { solicitudesDetectadas: getSolicitudesFromRow(headers, currentRow) };
+  const observations = sheetsService.getRowObservations(headers, currentRow);
+  const { updates, reply } = buildUpdatesFromIA({
+    iaResult,
+    messageText,
+    phoneNumber,
+    timezone,
+    rowData,
+    observations,
+    forceHumanReview
+  });
+
+  const updated = await sheetsService.updateAllowedColumns({ headers, rowIndex, currentRow, updates });
+  if (updated?.currentRow) existingAttention.currentRow = updated.currentRow;
+  existingAttention.state = updates.ESTADO_CHATBOT;
+  return reply;
+}
+
+async function handlePendingNameReply({ sheetsService, phoneNumber, messageText, timezone, existingAttention }) {
   const pending = pendingByPhone.get(phoneNumber);
   if (!pending) return null;
 
   console.log('[BOT] Pendiente encontrado por número', phoneNumber);
   if (!isLikelyFullName(messageText)) {
-    console.log('[BOT] Falta nombre completo válido para pendiente.');
+    console.log('[BOT] Falta nombre completo válido para pendiente. Mensaje registrado correctamente.');
+    await updateAttentionFromIA({
+      sheetsService,
+      phoneNumber,
+      messageText,
+      timezone,
+      existingAttention,
+      iaResult: {
+        ...pending.iaResultOriginal,
+        nombre_detectado: '',
+        respuesta_tipo: 'FALTA_NOMBRE',
+        requiere_humano: 'NO',
+        observacion: appendObservation(pending.iaResultOriginal.observacion, 'Falta nombre completo. Se solicitó al cliente.')
+      }
+    });
     return RESPONSES.FALTA_NOMBRE;
   }
 
@@ -168,10 +223,11 @@ async function handlePendingNameReply({ sheetsService, phoneNumber, messageText,
   const reply = await persistAttention({
     sheetsService,
     phoneNumber,
-    messageText: pending.messageTextOriginal,
+    messageText,
     iaResult,
     timezone,
-    detectedName: cleanedName
+    detectedName: cleanedName,
+    existingAttention
   });
 
   pendingByPhone.delete(phoneNumber);
@@ -192,6 +248,9 @@ function startWhatsappBot() {
   client.on('disconnected', (reason) => console.log('[WHATSAPP] Desconectado:', reason));
 
   client.on('message', async (msg) => {
+    let minimalAttention = null;
+    let phoneNumber = '';
+    let messageText = '';
     try {
       if (msg.from.includes('@g.us') || msg.fromMe) return;
       cleanupOldPending();
@@ -200,66 +259,67 @@ function startWhatsappBot() {
       const contact = await msg.getContact();
       if (!chat || !contact) return;
 
-      const phoneNumber = buildPhoneNumber(msg);
+      phoneNumber = buildPhoneNumber(msg);
       const visibleName = contact.pushname || contact.name || contact.shortName || '';
-      const messageText = (msg.body || '').trim();
+      messageText = (msg.body || '').trim();
       console.log('[BOT] Referencia WhatsApp visible:', visibleName || '(sin nombre visible)');
 
-      const pendingReply = await handlePendingNameReply({ sheetsService, phoneNumber, messageText, timezone });
+      minimalAttention = await sheetsService.upsertMinimalAttentionByPhone({
+        phoneNumber,
+        messageText,
+        timezone,
+        observations: 'Mensaje recibido. Pendiente de análisis.'
+      });
+
+      const pendingReply = await handlePendingNameReply({ sheetsService, phoneNumber, messageText, timezone, existingAttention: minimalAttention });
       if (pendingReply) {
         await msg.reply(pendingReply);
         return;
       }
 
-      const phoneAttention = await sheetsService.findAttentionByPhone(phoneNumber);
-      const canUpdateByPhone = phoneAttention.found && !isFinalState(phoneAttention.state);
-      const rowData = canUpdateByPhone
-        ? { solicitudesDetectadas: getSolicitudesFromRow(phoneAttention.headers, phoneAttention.currentRow) }
-        : { solicitudesDetectadas: '' };
+      const rowData = { solicitudesDetectadas: getSolicitudesFromRow(minimalAttention.headers, minimalAttention.currentRow) };
       const iaResult = await analyzeIncomingMessage({ messageText, contactName: visibleName, rowData });
       const detectedName = String(iaResult.nombre_detectado || '').trim();
 
-      if (canUpdateByPhone) {
-        const reply = await persistAttention({
-          sheetsService,
-          phoneNumber,
-          messageText,
-          iaResult,
-          timezone,
-          detectedName,
-          existingAttention: phoneAttention
-        });
-        await msg.reply(reply);
-        return;
-      }
-
-      if (phoneAttention.found && isFinalState(phoneAttention.state)) {
-        console.log('[BOT] Atención finalizada detectada para este número.');
-        const nameFromFinalAttention = phoneAttention.officialName;
-        if (!detectedName && nameFromFinalAttention && hasRealLoanRequest(iaResult)) {
-          const reply = await persistAttention({
+      if (!isLikelyFullName(detectedName)) {
+        if (hasRealLoanRequest(iaResult) || iaResult.respuesta_tipo === 'FALTA_NOMBRE') {
+          console.log('[BOT] Falta nombre. Mensaje registrado correctamente.');
+          savePending(phoneNumber, messageText, iaResult);
+          const reply = await updateAttentionFromIA({
             sheetsService,
             phoneNumber,
             messageText,
-            iaResult: { ...iaResult, nombre_detectado: nameFromFinalAttention },
             timezone,
-            detectedName: nameFromFinalAttention
+            existingAttention: minimalAttention,
+            iaResult: {
+              ...iaResult,
+              respuesta_tipo: 'FALTA_NOMBRE',
+              requiere_humano: 'NO',
+              observacion: appendObservation(iaResult.observacion, 'Falta nombre completo. Se solicitó al cliente.')
+            }
           });
           await msg.reply(reply);
           return;
         }
-      }
 
-      if (!isLikelyFullName(detectedName)) {
-        console.log('[BOT] Falta nombre completo.');
-        if (hasRealLoanRequest(iaResult) || iaResult.respuesta_tipo === 'FALTA_NOMBRE') {
-          savePending(phoneNumber, messageText, iaResult);
-          await msg.reply(RESPONSES.FALTA_NOMBRE);
-          return;
-        }
-
-        console.log('[BOT] Enviado a revisión humana sin registrar porque no hay solicitud clara ni nombre completo.');
-        await msg.reply(RESPONSES.REVISION_HUMANA);
+        console.log('[BOT] Solicitud no entendida. Caso registrado para revisión humana.');
+        const reply = await updateAttentionFromIA({
+          sheetsService,
+          phoneNumber,
+          messageText,
+          timezone,
+          existingAttention: minimalAttention,
+          iaResult: {
+            ...iaResult,
+            accion: 'NO_ENTENDIDO',
+            requiere_humano: 'SI',
+            respuesta_tipo: 'REVISION_HUMANA',
+            observacion: iaResult.error_tipo === 'TIMEOUT_IA'
+              ? appendObservation(iaResult.observacion, 'IA no respondió a tiempo. Revisar manualmente.')
+              : appendObservation(iaResult.observacion, 'Solicitud no entendida. Revisar manualmente.')
+          }
+        });
+        await msg.reply(reply);
         return;
       }
 
@@ -269,11 +329,34 @@ function startWhatsappBot() {
         messageText,
         iaResult,
         timezone,
-        detectedName
+        detectedName,
+        existingAttention: minimalAttention
       });
       await msg.reply(reply);
     } catch (error) {
       console.error('[BOT] Error general:', error.message);
+      if (minimalAttention) {
+        try {
+          await updateAttentionFromIA({
+            sheetsService,
+            phoneNumber,
+            messageText,
+            timezone,
+            existingAttention: minimalAttention,
+            iaResult: {
+              nombre_detectado: '',
+              accion: 'NO_ENTENDIDO',
+              solicitudes: [],
+              solicitud_actual: 'No se pudo procesar automáticamente.',
+              observacion: 'Error general del bot después del registro mínimo. Revisar manualmente.',
+              requiere_humano: 'SI',
+              respuesta_tipo: 'REVISION_HUMANA'
+            }
+          });
+        } catch (sheetError) {
+          console.error('[BOT] No se pudo marcar revisión humana tras error general:', sheetError.message);
+        }
+      }
       try {
         await msg.reply(RESPONSES.REVISION_HUMANA);
       } catch (_) {}
