@@ -1,5 +1,6 @@
 const { google } = require('googleapis');
 const { normalizeText, normalizePhone } = require('../utils/textUtils');
+const { getNowInTimeZone } = require('../utils/dateUtils');
 
 const CHATBOT_COLUMNS = [
   'NUMERO_WHATSAPP',
@@ -18,6 +19,12 @@ const FINAL_STATES = ['APROBADO', 'RECHAZADO', 'CERRADO'];
 const NAME_HEADER_CANDIDATES = ['NOMBRE DE CLIENTE', 'NOMBRE CLIENTE', 'CLIENTE', 'NOMBRE'];
 const OBSERVATIONS_HEADER_CANDIDATES = ['OBSERVACIONES', 'OBSERVACION'];
 const FIRST_PROTECTED_HEADER = 'CUOTA';
+
+
+function appendObservation(...observations) {
+  const parts = observations.map((part) => String(part || '').trim()).filter(Boolean);
+  return [...new Set(parts)].join(' ');
+}
 
 function columnToLetter(index) {
   let letter = '';
@@ -262,6 +269,57 @@ class GoogleSheetsService {
     return { rowIndex, currentRow: updated[rowIndex - 1] || row };
   }
 
+  async upsertMinimalAttentionByPhone({ phoneNumber, messageText, timezone, observations = 'Mensaje recibido. Pendiente de análisis.' }) {
+    const phoneAttention = await this.findAttentionByPhone(phoneNumber);
+    let headers = phoneAttention.headers;
+    let rowIndex;
+    let currentRow;
+    let created = false;
+
+    if (phoneAttention.found && !FINAL_STATES.includes(phoneAttention.state)) {
+      rowIndex = phoneAttention.rowIndex;
+      currentRow = phoneAttention.currentRow;
+    } else {
+      if (phoneAttention.found && FINAL_STATES.includes(phoneAttention.state)) {
+        console.log('[BOT] Atención finalizada detectada. Se crea nueva atención.');
+      }
+      const createdRow = await this.createAttentionRow({ headers, whatsappNumber: phoneNumber });
+      rowIndex = createdRow.rowIndex;
+      currentRow = createdRow.currentRow;
+      created = true;
+    }
+
+    const previousObservations = this.getRowObservations(headers, currentRow);
+    const updates = {
+      NUMERO_WHATSAPP: normalizePhone(phoneNumber),
+      ULTIMO_MENSAJE: messageText,
+      ESTADO_CHATBOT: 'NUEVO',
+      FECHA_ULTIMO_CONTACTO: getNowInTimeZone(timezone),
+      REQUIERE_HUMANO: 'NO',
+      OBSERVACIONES: appendObservation(previousObservations, observations)
+    };
+
+    const updated = await this.updateAllowedColumns({ headers, rowIndex, currentRow, updates });
+    currentRow = updated?.currentRow || currentRow;
+
+    if (created) {
+      console.log(`[SHEETS] Registro mínimo creado para NUMERO_WHATSAPP=${normalizePhone(phoneNumber)} fila=${rowIndex}`);
+    } else {
+      console.log(`[SHEETS] Registro mínimo actualizado para NUMERO_WHATSAPP=${normalizePhone(phoneNumber)} fila=${rowIndex}`);
+    }
+
+    return {
+      found: true,
+      created,
+      headers,
+      rowIndex,
+      currentRow,
+      state: 'NUEVO',
+      officialName: this.getRowName(headers, currentRow),
+      reason: created ? 'registro_minimo_creado' : 'registro_minimo_actualizado'
+    };
+  }
+
   async updateAllowedColumns({ headers, rowIndex, currentRow, updates }) {
     const safeEntries = Object.entries(updates).filter(([key, value]) => {
       if (!ALLOWED_WRITE_COLUMNS.includes(key)) return false;
@@ -269,7 +327,7 @@ class GoogleSheetsService {
       return value !== undefined;
     });
 
-    if (!safeEntries.length) return;
+    if (!safeEntries.length) return { rowIndex, currentRow };
 
     safeEntries.forEach(([key, value]) => {
       const colIndex = key === 'OBSERVACIONES'
@@ -288,6 +346,7 @@ class GoogleSheetsService {
     });
 
     console.log('[SHEETS] Fila actualizada', rowIndex);
+    return { rowIndex, currentRow };
   }
 }
 
