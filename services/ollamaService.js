@@ -34,15 +34,18 @@ function buildPrompt({ message, contactName, previousSolicitudes }) {
     });
 }
 
-function fallbackResult() {
+function fallbackResult(errorTipo = '') {
   return {
     nombre_detectado: '',
     accion: 'NO_ENTENDIDO',
     solicitudes: [],
     solicitud_actual: 'No se pudo interpretar la solicitud.',
-    observacion: 'Mensaje ambiguo o formato inválido de IA. Requiere revisión manual.',
+    observacion: errorTipo === 'TIMEOUT_IA'
+      ? 'IA no respondió a tiempo. Revisar manualmente.'
+      : 'Mensaje ambiguo o formato inválido de IA. Requiere revisión manual.',
     requiere_humano: 'SI',
-    respuesta_tipo: 'REVISION_HUMANA'
+    respuesta_tipo: 'REVISION_HUMANA',
+    error_tipo: errorTipo
   };
 }
 
@@ -80,6 +83,7 @@ function sanitizeIAResult(parsed) {
 async function interpretMessage(input) {
   const ollamaUrl = process.env.OLLAMA_URL;
   const model = process.env.OLLAMA_MODEL || 'mistral';
+  const timeout = Number(process.env.OLLAMA_TIMEOUT_MS || 45000);
 
   const payload = {
     model,
@@ -89,13 +93,19 @@ async function interpretMessage(input) {
   };
 
   try {
-    const response = await axios.post(ollamaUrl, payload, { timeout: 45000 });
+    const response = await axios.post(ollamaUrl, payload, { timeout });
     const raw = response.data?.response || '{}';
     const parsed = JSON.parse(raw);
     return sanitizeIAResult(parsed);
   } catch (error) {
+    const isTimeout = error.code === 'ECONNABORTED' || String(error.message || '').includes('timeout');
+    if (isTimeout) {
+      console.error('[OLLAMA] Timeout controlado. Se marca EN_REVISION:', error.message);
+      return fallbackResult('TIMEOUT_IA');
+    }
+
     console.error('[OLLAMA] Error:', error.message);
-    return fallbackResult();
+    return fallbackResult('ERROR_IA');
   }
 }
 
