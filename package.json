@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node index.js",
     "dev": "node --watch index.js",
-    "test:rules": "node scripts/testRuleFallback.js"
+    "test:rules": "node scripts/testRuleFallback.js",
+    "test:orchestrator": "node scripts/testConversationOrchestrator.js"
   },
   "keywords": [
     "whatsapp",

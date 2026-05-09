@@ -1,5 +1,6 @@
 const { google } = require('googleapis');
 const { normalizeText, normalizePhone } = require('../utils/textUtils');
+const { validateRealPhone } = require('../utils/phoneUtils');
 const { getNowInTimeZone } = require('../utils/dateUtils');
 const { appendObservationLimited } = require('../utils/observationUtils');
 
@@ -204,7 +205,10 @@ class GoogleSheetsService {
       .map((row, idx) => this.rowToMatch(headers, row, idx + 2))
       .filter((match) => {
         const observations = this.getRowObservations(headers, match.row);
-        return normalizedIdentifier && observations.includes(`Identificador WhatsApp interno: ${normalizedIdentifier}`);
+        return normalizedIdentifier && (
+          observations.includes(`Referencia técnica WhatsApp: ${normalizedIdentifier}`)
+          || observations.includes(`Identificador WhatsApp interno: ${normalizedIdentifier}`)
+        );
       });
 
     if (!matches.length) return { found: false, headers, ambiguous: false, reason: 'identificador_interno_sin_coincidencia' };
@@ -263,7 +267,8 @@ class GoogleSheetsService {
     const nameCol = this.findNameColumnIndex(headers);
     const observationsCol = this.findObservationsColumnIndex(headers);
 
-    if (phoneCol >= 0) row[phoneCol] = normalizePhone(whatsappNumber);
+    const validPhone = validateRealPhone(whatsappNumber);
+    if (phoneCol >= 0 && validPhone.isRealPhone) row[phoneCol] = validPhone.normalizedPhone;
     if (nameCol >= 0 && officialName) row[nameCol] = officialName;
     if (observationsCol >= 0 && observations) row[observationsCol] = observations;
 
@@ -314,13 +319,15 @@ class GoogleSheetsService {
 
     const previousObservations = this.getRowObservations(headers, currentRow);
     const updates = {
-      NUMERO_WHATSAPP: normalizePhone(phoneNumber),
       ULTIMO_MENSAJE: messageText,
       ESTADO_CHATBOT: 'NUEVO',
       FECHA_ULTIMO_CONTACTO: getNowInTimeZone(timezone),
       REQUIERE_HUMANO: 'NO',
       OBSERVACIONES: appendObservation(previousObservations, observations)
     };
+
+    const validPhone = validateRealPhone(phoneNumber);
+    if (validPhone.isRealPhone) updates.NUMERO_WHATSAPP = validPhone.normalizedPhone;
 
     const updated = await this.updateAllowedColumns({ headers, rowIndex, currentRow, updates });
     currentRow = updated?.currentRow || currentRow;
