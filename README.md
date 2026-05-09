@@ -7,7 +7,7 @@ Proyecto Node.js para atender mensajes por **WhatsApp Web**, interpretar solicit
 - Usa `whatsapp-web.js` (no WhatsApp Business API).
 - Usa IA local con Ollama (`OLLAMA_MODEL` configurable).
 - Trabaja en **una sola hoja**: una fila por atención o solicitud abierta.
-- Busca cliente por `NUMERO_WHATSAPP`; si no existe, busca por nombre.
+- Busca atenciones activas por `NUMERO_WHATSAPP` real o referencia técnica en `OBSERVACIONES`; el nombre oficial se valida aparte.
 - Solo escribe en columnas permitidas del chatbot.
 - Nunca modifica columnas internas protegidas.
 - Maneja solicitudes múltiples (agregar, reemplazar, cancelar, actualizar monto, etc.).
@@ -28,12 +28,16 @@ whatsapp-chatbot-prestamos/
 │   └── tiposSolicitud.json
 ├── services/
 │   ├── whatsappService.js
+│   ├── conversationOrchestrator.js
 │   ├── ollamaService.js
+│   ├── ruleFallbackService.js
 │   ├── googleSheetsService.js
 │   └── chatbotService.js
 ├── utils/
 │   ├── dateUtils.js
 │   ├── textUtils.js
+│   ├── phoneUtils.js
+│   ├── observationUtils.js
 │   └── solicitudesUtils.js
 └── logs/
     └── .gitkeep
@@ -123,7 +127,7 @@ npm start
 - El bot solo registra, resume, ordena solicitudes y deriva a humano cuando corresponde.
 - Todo mensaje privado se registra primero con datos mínimos en Google Sheets antes de llamar a la IA.
 - El bot espera un breve periodo antes de responder para agrupar mensajes rápidos del mismo cliente; registra inmediatamente, pero analiza y responde después del buffer conversacional.
-- Si WhatsApp Web no entrega un número real, se registra temporalmente el identificador disponible, se deja constancia en `OBSERVACIONES` y se pide el celular real al cliente.
+- Si WhatsApp Web no entrega un número real, **no** se escribe el identificador interno en `NUMERO_WHATSAPP`; solo se deja como referencia técnica en `OBSERVACIONES` y se pide el celular real al cliente.
 - Si falla IA u Ollama no responde a tiempo, el mensaje ya queda registrado y el bot intenta interpretar con reglas locales antes de derivar a revisión humana.
 
 ## Configuración dinámica de tipos de solicitud
@@ -139,7 +143,7 @@ Allí puedes agregar nuevos tipos (ej. `BONO_NAVIDAD`) y sinónimos sin tocar c�
 - Se ignoran grupos (`@g.us`).
 - Se ignoran mensajes propios (`fromMe`).
 - Una fila representa una atención o solicitud abierta; un cliente puede tener varias líneas históricas.
-- Los mensajes por partes del mismo número actualizan la misma atención activa: `ULTIMO_MENSAJE` y `FECHA_ULTIMO_CONTACTO` se refrescan, y `OBSERVACIONES` conserva contexto breve. Si el primer mensaje deja una solicitud con `NO_INDICADO`, un mensaje posterior con solo el monto puede completar esa misma solicitud.
+- Los mensajes por partes de la misma referencia conversacional actualizan la misma atención activa: `ULTIMO_MENSAJE` y `FECHA_ULTIMO_CONTACTO` se refrescan, y `OBSERVACIONES` conserva contexto breve. Si el primer mensaje deja una solicitud con `NO_INDICADO`, un mensaje posterior con solo el monto puede completar esa misma solicitud.
 - La IA recibe mensajes recientes, mensaje combinado, solicitudes previas, estado actual y observaciones relevantes para interpretar la conversación completa.
 - `ESTADO_CHATBOT` usa estados activos (`NUEVO`, `PENDIENTE_DATOS`, `EN_REVISION`) y finales (`APROBADO`, `RECHAZADO`, `CERRADO`).
 
@@ -147,7 +151,7 @@ Allí puedes agregar nuevos tipos (ej. `BONO_NAVIDAD`) y sinónimos sin tocar c�
 
 Incluye trazas para:
 
-- registro mínimo creado o actualizado por número
+- registro mínimo creado o actualizado por número real o referencia técnica
 - mensaje recibido
 - cliente encontrado/no encontrado
 - acción detectada por IA
@@ -163,11 +167,11 @@ Incluye trazas para:
 - **Estados activos**: `NUEVO`, `PENDIENTE_DATOS`, `EN_REVISION`. Mientras una línea esté activa, el bot puede actualizar esa misma atención.
 - **Estados finales**: `APROBADO`, `RECHAZADO`, `CERRADO`. El humano decide manualmente cuándo cerrar, aprobar o rechazar; el bot no finaliza solicitudes por cuenta propia.
 - Si la atención está finalizada y el cliente vuelve a solicitar algo, el bot crea una **nueva línea** y no modifica la línea finalizada.
-- `NUMERO_WHATSAPP` es un dato de contacto y ayuda a ubicar atenciones activas, pero el nombre oficial depende de `NOMBRE DE CLIENTE`. Cuando WhatsApp Web solo entrega un identificador interno, el bot deja `Identificador WhatsApp interno: ...` en `OBSERVACIONES` para ubicar la atención activa y solicita el celular real.
-- El nombre visible de WhatsApp (`pushname`, `name` o `shortName`) solo se usa como referencia en logs/contexto de IA; **no se escribe ni se usa como nombre oficial**.
+- `NUMERO_WHATSAPP` guarda únicamente un celular real. Cuando WhatsApp Web solo entrega un identificador interno, `@lid` o un valor raro, el bot deja `Referencia técnica WhatsApp: ...` en `OBSERVACIONES` para ubicar la atención activa y solicita el celular real, sin escribir ese identificador en `NUMERO_WHATSAPP`.
+- El nombre visible de WhatsApp (`pushname`, `name` o `shortName`) solo se usa como referencia en logs y `OBSERVACIONES`; **no se escribe ni se usa como `NOMBRE DE CLIENTE`**.
 - `NOMBRE DE CLIENTE` depende de una lista interna, validación o sugerencia de Google Sheets. Si `nombre_detectado` coincide con esa lista/base, se puede escribir en `NOMBRE DE CLIENTE`.
 - Si `nombre_detectado` no coincide, el bot **no fuerza** ese valor en `NOMBRE DE CLIENTE`; crea la línea con nombre vacío, guarda el nombre en `OBSERVACIONES` y marca `REQUIERE_HUMANO=SI`.
-- Si falta nombre completo, el bot registra o actualiza la atención con `ESTADO_CHATBOT=PENDIENTE_DATOS`, guarda contexto breve en `OBSERVACIONES`, conserva un pendiente temporal en memoria por `NUMERO_WHATSAPP` y solicita el nombre completo.
+- Si falta nombre completo, el bot registra o actualiza la atención con `ESTADO_CHATBOT=PENDIENTE_DATOS`, guarda contexto breve en `OBSERVACIONES`, conserva un pendiente temporal en memoria por referencia conversacional y solicita el nombre completo.
 - Los pendientes temporales viven en memoria (`Map`) y ayudan a unir mensajes por partes, pero Google Sheets conserva el registro mínimo aunque el servidor se reinicie.
 - Los ejemplos de mensajes son referenciales. La interpretación del lenguaje natural la hace Ollama; el código solo valida el JSON estructurado y aplica reglas seguras.
 - `ESTADO_CHATBOT` mantiene estados limpios: activos (`NUEVO`, `PENDIENTE_DATOS`, `EN_REVISION`) y finales (`APROBADO`, `RECHAZADO`, `CERRADO`). Los detalles técnicos como timeout, falta de nombre o solicitud no entendida se escriben en `OBSERVACIONES`, no como estados nuevos.
@@ -185,24 +189,26 @@ Si faltan columnas del chatbot, se insertan después de `NOMBRE DE CLIENTE` y an
 
 ## Flujos principales
 
-- **Registro mínimo garantizado**: cada mensaje privado crea o actualiza una atención activa por `NUMERO_WHATSAPP` antes de llamar a Ollama. Se guarda `NUMERO_WHATSAPP`, `ULTIMO_MENSAJE`, `FECHA_ULTIMO_CONTACTO`, `ESTADO_CHATBOT=NUEVO`, `REQUIERE_HUMANO=NO` y `OBSERVACIONES=Mensaje recibido. Pendiente de análisis.`.
+- **Registro mínimo garantizado**: cada mensaje privado crea o actualiza una atención activa antes de llamar a Ollama. Si existe celular real se guarda `NUMERO_WHATSAPP`; si solo hay ID interno, se guarda únicamente como referencia técnica en `OBSERVACIONES`. Siempre se actualizan `ULTIMO_MENSAJE`, `FECHA_ULTIMO_CONTACTO`, `ESTADO_CHATBOT=NUEVO`, `REQUIERE_HUMANO=NO` y `OBSERVACIONES=Mensaje recibido. Pendiente de análisis.`.
 - **Buffer conversacional**: el bot agrupa mensajes recientes por cliente y responde una sola vez cuando pasa `BOT_RESPONSE_DELAY_MS` sin nuevos mensajes, o cuando llega `BOT_MAX_RESPONSE_DELAY_MS` desde el primer mensaje del bloque.
-- **Sin nombre**: si la IA detecta solicitud pero no nombre completo, la fila queda registrada con `ESTADO_CHATBOT=PENDIENTE_DATOS`, se acumula `Falta nombre completo. Se solicitó al cliente.` en `OBSERVACIONES`, se guarda pendiente temporal y se responde con `FALTA_NOMBRE`.
+- **Sin nombre**: si la IA detecta solicitud pero no nombre completo, el orquestador deja la fila con `ESTADO_CHATBOT=PENDIENTE_DATOS`, acumula `Falta nombre completo. Se solicitó al cliente.` en `OBSERVACIONES`, conserva el pendiente temporal y responde con una plantilla segura que pide nombre completo.
 - **Respuesta con nombre**: al recibir el nombre desde el mismo número, se recupera el pendiente, se busca coincidencia en `NOMBRE DE CLIENTE`, se registra la atención y se elimina el pendiente.
 - **Nombre coincidente**: se usa el nombre oficial, se busca atención activa y se actualiza; si no hay activa, se crea nueva línea.
 - **Nombre no coincidente**: se crea nueva línea con `NOMBRE DE CLIENTE` vacío, se registra el nombre detectado en `OBSERVACIONES` y se marca revisión humana.
-- **Falta monto**: se guarda `NO_INDICADO`, `ESTADO_CHATBOT=PENDIENTE_DATOS` y se responde con `FALTA_MONTO`.
+- **Falta monto**: se guarda `NO_INDICADO`, `ESTADO_CHATBOT=PENDIENTE_DATOS` y se responde con una plantilla segura que pide el monto aproximado.
 - **IA no entiende**: se actualiza la misma atención activa con `ESTADO_CHATBOT=EN_REVISION`, `REQUIERE_HUMANO=SI` y `OBSERVACIONES=Solicitud no entendida. Revisar manualmente.`.
 - **Respuesta de IA validada**: Ollama puede devolver `respuesta_cliente`, pero el bot la valida y reemplaza por plantilla segura si contiene promesas de aprobación, desembolso, cobro o datos financieros reales.
 - **Fallback por reglas**: si Ollama no responde o devuelve una solicitud no entendida, el bot intenta detectar `DEUDA_GENERAL`, `AGUINALDO`, `BONO_ABRIL`, `BONO_JUNIO`, nombres, teléfonos y montos como `3000`, `3000 bs` o `Bs 3000`.
 - **Timeout de Ollama**: si las reglas entienden algo, se actualiza la misma atención y se responde según el dato faltante; si tampoco entienden, se usa `ESTADO_CHATBOT=EN_REVISION`, `REQUIERE_HUMANO=SI` y `OBSERVACIONES=IA no respondió y no se pudo interpretar por reglas.`.
 - **REEMPLAZAR inseguro**: si llega `REEMPLAZAR` sin solicitudes claras, no se borran solicitudes anteriores y se deriva a revisión humana.
+- **Arquitectura Fase 2**: `whatsappService.js` recibe mensajes, registra mínimo, maneja buffer y envía respuestas; `ollamaService.js` solo interpreta con IA; `ruleFallbackService.js` solo interpreta por reglas cuando la IA falla o no entiende; `conversationOrchestrator.js` valida y decide qué guardar, qué estado usar, qué dato falta, qué teléfono es válido, qué observaciones conservar y qué respuesta enviar; `googleSheetsService.js` solo escribe columnas permitidas.
 
 
 ## Pruebas locales
 
 ```bash
 npm run test:rules
+npm run test:orchestrator
 ```
 
-Este script valida el fallback por reglas, contrato conversacional, mensajes rápidos agrupados, mensajes por partes, respuestas seguras, observaciones limitadas y que no se generen actualizaciones para columnas protegidas.
+`test:rules` valida el fallback por reglas, contrato conversacional, mensajes rápidos agrupados, mensajes por partes, respuestas seguras, observaciones limitadas y que no se generen actualizaciones para columnas protegidas. `test:orchestrator` valida la Fase 2: orquestador central, deuda general, aguinaldo, bono abril/junio, falta de nombre, falta de celular real, ID interno fuera de `NUMERO_WHATSAPP`, nueva línea por atención cerrada, estados limpios y columnas protegidas.
