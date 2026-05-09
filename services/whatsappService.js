@@ -6,7 +6,11 @@ const { analyzeIncomingMessage, buildUpdatesFromIA, hasRealLoanRequest, RESPONSE
 const { normalizeText, normalizePhone, isLikelyFullName, cleanNameCandidate } = require('../utils/textUtils');
 
 const PENDING_TTL_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_RESPONSE_DELAY_MS = 45000;
+const DEFAULT_MAX_RESPONSE_DELAY_MS = 60000;
+const DEFAULT_MAX_BUFFER_MESSAGES = 8;
 const pendingByPhone = new Map();
+const conversationBufferByPhone = new Map();
 
 function buildPhoneNumber(msg) {
   const raw = msg.from || '';
@@ -125,6 +129,68 @@ function buildNameMismatchObservation(name, reason = 'No coincide con la lista i
 
 function resultHasMissingAmount(iaResult) {
   return Array.isArray(iaResult?.solicitudes) && iaResult.solicitudes.some((item) => String(item?.monto || '').trim() === 'NO_INDICADO');
+}
+
+function resultHasSolicitudes(iaResult) {
+  return Array.isArray(iaResult?.solicitudes) && iaResult.solicitudes.length > 0;
+}
+
+function normalizeResponseDelay(value, fallback) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+function buildBufferKey(phoneInfo, phoneNumber) {
+  return phoneInfo.internalIdentifier || phoneNumber;
+}
+
+function getPhoneFromIA(iaResult) {
+  const digits = normalizePhone(iaResult?.telefono_detectado || '');
+  return digits.length >= 7 && digits.length <= 15 ? digits : '';
+}
+
+function prepareResultForMissingData({ iaResult, detectedName, hasRealPhone }) {
+  if (resultHasMissingAmount(iaResult)) {
+    return {
+      ...iaResult,
+      respuesta_tipo: 'PEDIR_MONTO',
+      dato_faltante: 'MONTO',
+      requiere_humano: 'NO',
+      observacion: appendObservation(iaResult.observacion, 'Falta monto aproximado.')
+    };
+  }
+
+  if (resultHasSolicitudes(iaResult) && !isLikelyFullName(detectedName)) {
+    return {
+      ...iaResult,
+      respuesta_tipo: 'PEDIR_NOMBRE',
+      dato_faltante: 'NOMBRE',
+      requiere_humano: 'NO',
+      observacion: appendObservation(iaResult.observacion, 'Falta nombre completo. Se solicitó al cliente.')
+    };
+  }
+
+  if (resultHasSolicitudes(iaResult) && !hasRealPhone) {
+    return {
+      ...iaResult,
+      respuesta_tipo: 'PEDIR_TELEFONO',
+      dato_faltante: 'TELEFONO',
+      requiere_humano: 'NO',
+      observacion: appendObservation(iaResult.observacion, 'Falta número real de celular. Se solicitó al cliente.')
+    };
+  }
+
+  if (!resultHasSolicitudes(iaResult) && iaResult.accion !== 'NO_ENTENDIDO') {
+    return {
+      ...iaResult,
+      respuesta_tipo: 'PEDIR_TIPO',
+      dato_faltante: 'TIPO_SOLICITUD',
+      requiere_humano: 'NO',
+      observacion: appendObservation(iaResult.observacion, 'Falta tipo de solicitud. Se solicitó aclaración al cliente.')
+    };
+  }
+
+  return iaResult;
 }
 
 async function resolveAttentionForKnownName({ sheetsService, phoneNumber, detectedName }) {
@@ -313,10 +379,158 @@ async function handlePendingNameReply({ sheetsService, phoneNumber, messageText,
   return reply;
 }
 
+
+async function processConversationBuffer({ bufferKey, sheetsService, timezone }) {
+  const entry = conversationBufferByPhone.get(bufferKey);
+  if (!entry) return;
+  conversationBufferByPhone.delete(bufferKey);
+  if (entry.timer) clearTimeout(entry.timer);
+
+  const messages = entry.messages.map((item) => item.text).filter(Boolean);
+  const combinedMessage = messages.join(' ').replace(/\s+/g, ' ').trim();
+  const latestMessage = entry.messages[entry.messages.length - 1];
+  const phoneInfo = entry.phoneInfo;
+  let phoneNumber = entry.phoneNumber;
+  const minimalAttention = entry.minimalAttention;
+
+  try {
+    const pendingReply = await handlePendingNameReply({
+      sheetsService,
+      phoneNumber,
+      messageText: combinedMessage,
+      timezone,
+      existingAttention: minimalAttention,
+      lookupIdentifiers: phoneInfo.lookupIdentifiers
+    });
+    if (pendingReply) {
+      await latestMessage.msg.reply(pendingReply);
+      return;
+    }
+
+    const rowData = {
+      solicitudesDetectadas: getSolicitudesFromRow(minimalAttention.headers, minimalAttention.currentRow),
+      estadoActual: minimalAttention.state || '',
+      observaciones: sheetsService.getRowObservations(minimalAttention.headers, minimalAttention.currentRow),
+      faltaNombre: true,
+      faltaTelefono: !phoneInfo.hasRealPhone,
+      faltaMonto: false,
+      faltaTipo: false
+    };
+    const iaResult = await analyzeIncomingMessage({
+      messageText: combinedMessage,
+      contactName: entry.visibleName,
+      rowData,
+      mensajesRecientes: messages
+    });
+    const detectedPhone = getPhoneFromIA(iaResult);
+    const hasRealPhone = phoneInfo.hasRealPhone || Boolean(detectedPhone);
+    if (detectedPhone) phoneNumber = detectedPhone;
+
+    const detectedName = String(iaResult.nombre_detectado || '').trim();
+    let iaResultForPersistence = prepareResultForMissingData({ iaResult, detectedName, hasRealPhone });
+
+    if (iaResultForPersistence.respuesta_tipo === 'PEDIR_NOMBRE') {
+      savePending(bufferKey, combinedMessage, iaResultForPersistence);
+    }
+
+    if (!resultHasSolicitudes(iaResultForPersistence) && iaResultForPersistence.accion === 'NO_ENTENDIDO') {
+      iaResultForPersistence = {
+        ...iaResultForPersistence,
+        requiere_humano: 'SI',
+        respuesta_tipo: 'REVISION_HUMANA',
+        observacion: iaResultForPersistence.error_tipo === 'TIMEOUT_IA'
+          ? appendObservation(iaResultForPersistence.observacion, 'IA no respondió y no se pudo interpretar por reglas.')
+          : appendObservation(iaResultForPersistence.observacion, 'Solicitud no entendida. Revisar manualmente.')
+      };
+      const reply = await updateAttentionFromIA({
+        sheetsService,
+        phoneNumber,
+        messageText: combinedMessage,
+        timezone,
+        existingAttention: minimalAttention,
+        iaResult: iaResultForPersistence
+      });
+      await latestMessage.msg.reply(reply);
+      return;
+    }
+
+    const reply = await persistAttention({
+      sheetsService,
+      phoneNumber,
+      messageText: combinedMessage,
+      iaResult: iaResultForPersistence,
+      timezone,
+      detectedName,
+      existingAttention: minimalAttention
+    });
+    await latestMessage.msg.reply(reply);
+  } catch (error) {
+    console.error('[BOT] Error procesando buffer conversacional:', error.message);
+    try {
+      await updateAttentionFromIA({
+        sheetsService,
+        phoneNumber,
+        messageText: combinedMessage,
+        timezone,
+        existingAttention: minimalAttention,
+        iaResult: {
+          nombre_detectado: '',
+          accion: 'NO_ENTENDIDO',
+          solicitudes: [],
+          solicitud_actual: 'No se pudo procesar automáticamente.',
+          observacion: 'Error general del bot después del registro mínimo. Revisar manualmente.',
+          requiere_humano: 'SI',
+          respuesta_tipo: 'REVISION_HUMANA'
+        }
+      });
+      await latestMessage.msg.reply(RESPONSES.REVISION_HUMANA);
+    } catch (replyError) {
+      console.error('[BOT] No se pudo responder tras error de buffer:', replyError.message);
+    }
+  }
+}
+
+function scheduleConversationBuffer({ bufferKey, msg, messageText, phoneNumber, phoneInfo, visibleName, minimalAttention, sheetsService, timezone, responseDelayMs, maxResponseDelayMs, maxBufferMessages }) {
+  const now = Date.now();
+  const existing = conversationBufferByPhone.get(bufferKey);
+  const entry = existing || {
+    messages: [],
+    timer: null,
+    createdAt: now,
+    lastMessageAt: now,
+    minimalAttention,
+    phoneNumber,
+    phoneInfo,
+    visibleName
+  };
+
+  if (entry.timer) clearTimeout(entry.timer);
+  entry.messages.push({ text: messageText, msg, receivedAt: now });
+  if (entry.messages.length > maxBufferMessages) entry.messages = entry.messages.slice(-maxBufferMessages);
+  entry.lastMessageAt = now;
+  entry.minimalAttention = minimalAttention;
+  entry.phoneNumber = phoneNumber;
+  entry.phoneInfo = phoneInfo;
+  entry.visibleName = visibleName;
+
+  const elapsed = now - entry.createdAt;
+  const remainingMax = Math.max(0, maxResponseDelayMs - elapsed);
+  const waitMs = Math.min(responseDelayMs, remainingMax);
+  conversationBufferByPhone.set(bufferKey, entry);
+
+  console.log(`[BOT] Mensaje agregado al buffer ${bufferKey}. Total=${entry.messages.length}. Espera=${waitMs}ms`);
+  entry.timer = setTimeout(() => {
+    processConversationBuffer({ bufferKey, sheetsService, timezone });
+  }, waitMs);
+}
+
 function startWhatsappBot() {
   const sheetsService = new GoogleSheetsService();
   const client = createWhatsappClient();
   const timezone = process.env.TIMEZONE || 'America/La_Paz';
+  const responseDelayMs = normalizeResponseDelay(process.env.BOT_RESPONSE_DELAY_MS, DEFAULT_RESPONSE_DELAY_MS);
+  const maxResponseDelayMs = normalizeResponseDelay(process.env.BOT_MAX_RESPONSE_DELAY_MS, DEFAULT_MAX_RESPONSE_DELAY_MS);
+  const maxBufferMessages = normalizeResponseDelay(process.env.BOT_MAX_BUFFER_MESSAGES, DEFAULT_MAX_BUFFER_MESSAGES);
 
   client.on('qr', (qr) => {
     console.log('[WHATSAPP] Escanea este QR para autenticar:');
@@ -350,114 +564,25 @@ function startWhatsappBot() {
         messageText,
         timezone,
         lookupIdentifiers: phoneInfo.lookupIdentifiers,
-        observations: appendObservation('Mensaje recibido. Pendiente de análisis.', phoneInfo.missingPhoneObservation, phoneInfo.internalObservation)
+        observations: appendObservation('Mensaje recibido. Pendiente de análisis.', visibleName ? `Referencia WhatsApp visible: ${visibleName}.` : '', phoneInfo.missingPhoneObservation, phoneInfo.internalObservation)
       });
 
-      const pendingReply = await handlePendingNameReply({
-        sheetsService,
-        phoneNumber,
+      const bufferKey = buildBufferKey(phoneInfo, phoneNumber);
+      scheduleConversationBuffer({
+        bufferKey,
+        msg,
         messageText,
-        timezone,
-        existingAttention: minimalAttention,
-        lookupIdentifiers: phoneInfo.lookupIdentifiers
-      });
-      if (pendingReply) {
-        await msg.reply(pendingReply);
-        return;
-      }
-
-      const rowData = { solicitudesDetectadas: getSolicitudesFromRow(minimalAttention.headers, minimalAttention.currentRow) };
-      const iaResult = await analyzeIncomingMessage({ messageText, contactName: visibleName, rowData });
-      const detectedName = String(iaResult.nombre_detectado || '').trim();
-
-      if (!isLikelyFullName(detectedName)) {
-        if (resultHasMissingAmount(iaResult) || iaResult.respuesta_tipo === 'FALTA_MONTO') {
-          console.log('[BOT] Falta monto. Mensaje registrado correctamente.');
-          const reply = await updateAttentionFromIA({
-            sheetsService,
-            phoneNumber,
-            messageText,
-            timezone,
-            existingAttention: minimalAttention,
-            iaResult: {
-              ...iaResult,
-              respuesta_tipo: 'FALTA_MONTO',
-              requiere_humano: 'NO',
-              observacion: appendObservation(iaResult.observacion, 'Falta monto aproximado.')
-            }
-          });
-          await msg.reply(reply);
-          return;
-        }
-
-        if (hasRealLoanRequest(iaResult) || iaResult.respuesta_tipo === 'FALTA_NOMBRE') {
-          console.log('[BOT] Falta nombre. Mensaje registrado correctamente.');
-          savePending(phoneNumber, messageText, iaResult);
-          const reply = await updateAttentionFromIA({
-            sheetsService,
-            phoneNumber,
-            messageText,
-            timezone,
-            existingAttention: minimalAttention,
-            iaResult: {
-              ...iaResult,
-              respuesta_tipo: 'FALTA_NOMBRE',
-              requiere_humano: 'NO',
-              observacion: appendObservation(iaResult.observacion, 'Falta nombre completo. Se solicitó al cliente.')
-            }
-          });
-          await msg.reply(reply);
-          return;
-        }
-
-        console.log('[BOT] Solicitud no entendida. Caso registrado para revisión humana.');
-        const reply = await updateAttentionFromIA({
-          sheetsService,
-          phoneNumber,
-          messageText,
-          timezone,
-          existingAttention: minimalAttention,
-          iaResult: {
-            ...iaResult,
-            accion: 'NO_ENTENDIDO',
-            requiere_humano: 'SI',
-            respuesta_tipo: 'REVISION_HUMANA',
-            observacion: iaResult.error_tipo === 'TIMEOUT_IA'
-              ? appendObservation(iaResult.observacion, 'IA no respondió y no se pudo interpretar por reglas.')
-              : appendObservation(iaResult.observacion, 'Solicitud no entendida. Revisar manualmente.')
-          }
-        });
-        await msg.reply(reply);
-        return;
-      }
-
-      let iaResultForPersistence = iaResult;
-      if (!phoneInfo.hasRealPhone && !resultHasMissingAmount(iaResult)) {
-        iaResultForPersistence = {
-          ...iaResult,
-          respuesta_tipo: 'FALTA_TELEFONO',
-          requiere_humano: 'NO',
-          observacion: appendObservation(iaResult.observacion, 'Falta número real de celular. Se solicitó al cliente.')
-        };
-      } else if (iaResult.accion === 'NO_ENTENDIDO') {
-        iaResultForPersistence = {
-          ...iaResult,
-          respuesta_tipo: 'FALTA_TIPO',
-          requiere_humano: 'NO',
-          observacion: appendObservation(iaResult.observacion, 'Falta tipo de solicitud. Se solicitó aclaración al cliente.')
-        };
-      }
-
-      const reply = await persistAttention({
-        sheetsService,
         phoneNumber,
-        messageText,
-        iaResult: iaResultForPersistence,
+        phoneInfo,
+        visibleName,
+        minimalAttention,
+        sheetsService,
         timezone,
-        detectedName,
-        existingAttention: minimalAttention
+        responseDelayMs,
+        maxResponseDelayMs,
+        maxBufferMessages
       });
-      await msg.reply(reply);
+      return;
     } catch (error) {
       console.error('[BOT] Error general:', error.message);
       if (minimalAttention) {
@@ -492,4 +617,4 @@ function startWhatsappBot() {
   return client;
 }
 
-module.exports = { startWhatsappBot, pendingByPhone };
+module.exports = { startWhatsappBot, pendingByPhone, conversationBufferByPhone, scheduleConversationBuffer };

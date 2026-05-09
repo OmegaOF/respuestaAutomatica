@@ -1,6 +1,7 @@
 const { google } = require('googleapis');
 const { normalizeText, normalizePhone } = require('../utils/textUtils');
 const { getNowInTimeZone } = require('../utils/dateUtils');
+const { appendObservationLimited } = require('../utils/observationUtils');
 
 const CHATBOT_COLUMNS = [
   'NUMERO_WHATSAPP',
@@ -22,8 +23,7 @@ const FIRST_PROTECTED_HEADER = 'CUOTA';
 
 
 function appendObservation(...observations) {
-  const parts = observations.map((part) => String(part || '').trim()).filter(Boolean);
-  return [...new Set(parts)].join(' ');
+  return appendObservationLimited(...observations);
 }
 
 function columnToLetter(index) {

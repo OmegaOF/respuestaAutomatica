@@ -94,6 +94,9 @@ Completar `.env`:
 - `TIMEZONE` → por defecto `America/La_Paz`.
 - `OLLAMA_TIMEOUT_MS` → timeout de Ollama en milisegundos; por defecto `45000`.
 - `DEBUG_WHATSAPP_IDS` → `true` solo para depurar qué identificadores entrega WhatsApp Web; por defecto `false`.
+- `BOT_RESPONSE_DELAY_MS` → espera normal antes de responder desde el último mensaje; por defecto `45000`.
+- `BOT_MAX_RESPONSE_DELAY_MS` → espera máxima absoluta desde el primer mensaje del bloque; por defecto `60000`.
+- `BOT_MAX_BUFFER_MESSAGES` → cantidad máxima de mensajes recientes que se juntan antes de analizar; por defecto `8`.
 
 ## 6) Instalar dependencias
 
@@ -119,6 +122,7 @@ npm start
 - El bot **no modifica columnas internas** (`CUOTA`, `Deuda General`, `BONO ABRIL`, `BONO JUNIO`, `AGUI`, `TOTAL`).
 - El bot solo registra, resume, ordena solicitudes y deriva a humano cuando corresponde.
 - Todo mensaje privado se registra primero con datos mínimos en Google Sheets antes de llamar a la IA.
+- El bot espera un breve periodo antes de responder para agrupar mensajes rápidos del mismo cliente; registra inmediatamente, pero analiza y responde después del buffer conversacional.
 - Si WhatsApp Web no entrega un número real, se registra temporalmente el identificador disponible, se deja constancia en `OBSERVACIONES` y se pide el celular real al cliente.
 - Si falla IA u Ollama no responde a tiempo, el mensaje ya queda registrado y el bot intenta interpretar con reglas locales antes de derivar a revisión humana.
 
@@ -136,6 +140,7 @@ Allí puedes agregar nuevos tipos (ej. `BONO_NAVIDAD`) y sinónimos sin tocar c�
 - Se ignoran mensajes propios (`fromMe`).
 - Una fila representa una atención o solicitud abierta; un cliente puede tener varias líneas históricas.
 - Los mensajes por partes del mismo número actualizan la misma atención activa: `ULTIMO_MENSAJE` y `FECHA_ULTIMO_CONTACTO` se refrescan, y `OBSERVACIONES` conserva contexto breve. Si el primer mensaje deja una solicitud con `NO_INDICADO`, un mensaje posterior con solo el monto puede completar esa misma solicitud.
+- La IA recibe mensajes recientes, mensaje combinado, solicitudes previas, estado actual y observaciones relevantes para interpretar la conversación completa.
 - `ESTADO_CHATBOT` usa estados activos (`NUEVO`, `PENDIENTE_DATOS`, `EN_REVISION`) y finales (`APROBADO`, `RECHAZADO`, `CERRADO`).
 
 ## Logs en consola
@@ -181,13 +186,15 @@ Si faltan columnas del chatbot, se insertan después de `NOMBRE DE CLIENTE` y an
 ## Flujos principales
 
 - **Registro mínimo garantizado**: cada mensaje privado crea o actualiza una atención activa por `NUMERO_WHATSAPP` antes de llamar a Ollama. Se guarda `NUMERO_WHATSAPP`, `ULTIMO_MENSAJE`, `FECHA_ULTIMO_CONTACTO`, `ESTADO_CHATBOT=NUEVO`, `REQUIERE_HUMANO=NO` y `OBSERVACIONES=Mensaje recibido. Pendiente de análisis.`.
+- **Buffer conversacional**: el bot agrupa mensajes recientes por cliente y responde una sola vez cuando pasa `BOT_RESPONSE_DELAY_MS` sin nuevos mensajes, o cuando llega `BOT_MAX_RESPONSE_DELAY_MS` desde el primer mensaje del bloque.
 - **Sin nombre**: si la IA detecta solicitud pero no nombre completo, la fila queda registrada con `ESTADO_CHATBOT=PENDIENTE_DATOS`, se acumula `Falta nombre completo. Se solicitó al cliente.` en `OBSERVACIONES`, se guarda pendiente temporal y se responde con `FALTA_NOMBRE`.
 - **Respuesta con nombre**: al recibir el nombre desde el mismo número, se recupera el pendiente, se busca coincidencia en `NOMBRE DE CLIENTE`, se registra la atención y se elimina el pendiente.
 - **Nombre coincidente**: se usa el nombre oficial, se busca atención activa y se actualiza; si no hay activa, se crea nueva línea.
 - **Nombre no coincidente**: se crea nueva línea con `NOMBRE DE CLIENTE` vacío, se registra el nombre detectado en `OBSERVACIONES` y se marca revisión humana.
 - **Falta monto**: se guarda `NO_INDICADO`, `ESTADO_CHATBOT=PENDIENTE_DATOS` y se responde con `FALTA_MONTO`.
 - **IA no entiende**: se actualiza la misma atención activa con `ESTADO_CHATBOT=EN_REVISION`, `REQUIERE_HUMANO=SI` y `OBSERVACIONES=Solicitud no entendida. Revisar manualmente.`.
-- **Fallback por reglas**: si Ollama no responde o devuelve una solicitud no entendida, el bot intenta detectar `DEUDA_GENERAL`, `AGUINALDO`, `BONO_ABRIL`, `BONO_JUNIO` y montos como `3000`, `3000 bs` o `Bs 3000`.
+- **Respuesta de IA validada**: Ollama puede devolver `respuesta_cliente`, pero el bot la valida y reemplaza por plantilla segura si contiene promesas de aprobación, desembolso, cobro o datos financieros reales.
+- **Fallback por reglas**: si Ollama no responde o devuelve una solicitud no entendida, el bot intenta detectar `DEUDA_GENERAL`, `AGUINALDO`, `BONO_ABRIL`, `BONO_JUNIO`, nombres, teléfonos y montos como `3000`, `3000 bs` o `Bs 3000`.
 - **Timeout de Ollama**: si las reglas entienden algo, se actualiza la misma atención y se responde según el dato faltante; si tampoco entienden, se usa `ESTADO_CHATBOT=EN_REVISION`, `REQUIERE_HUMANO=SI` y `OBSERVACIONES=IA no respondió y no se pudo interpretar por reglas.`.
 - **REEMPLAZAR inseguro**: si llega `REEMPLAZAR` sin solicitudes claras, no se borran solicitudes anteriores y se deriva a revisión humana.
 
@@ -198,4 +205,4 @@ Si faltan columnas del chatbot, se insertan después de `NOMBRE DE CLIENTE` y an
 npm run test:rules
 ```
 
-Este script valida el fallback por reglas para deuda general, aguinaldo, bonos, montos, mensajes por partes y que no se generen actualizaciones para columnas protegidas.
+Este script valida el fallback por reglas, contrato conversacional, mensajes rápidos agrupados, mensajes por partes, respuestas seguras, observaciones limitadas y que no se generen actualizaciones para columnas protegidas.
